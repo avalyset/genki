@@ -52,12 +52,16 @@ export const pgvectorDatasetOptions = z.strictObject({
 
 export const pgvectorEndpointOptions = z.strictObject({
   connection: z
-    .literal('platform', {
-      error: 'pgvector runs in the platform database; external connections are not accepted',
+    .enum(['platform', 'knowledge'], {
+      error:
+        'pgvector runs in the platform database or on the knowledge server; external connections are not accepted',
     })
-    .meta({ enumTitles: ['Plattformens database'] })
+    .meta({ enumTitles: ['Plattformens database', 'Kunnskapsserveren'] })
     .default('platform'),
 });
+
+const noKnowledgeServer = 'no knowledge server configured';
+const knowledgeNotReady = 'the knowledge server is not ready: its search tables are not built yet';
 
 export type PgvectorDatasetOptions = z.infer<typeof pgvectorDatasetOptions>;
 export type PgvectorEndpointOptions = z.infer<typeof pgvectorEndpointOptions>;
@@ -67,8 +71,16 @@ export interface QueryEmbedder {
   embed(texts: string[]): Promise<number[][]>;
 }
 
+export interface KnowledgePools {
+  reader?: Pool;
+  writer?: Pool;
+  owner?: Pool;
+}
+
 export interface PgvectorEngineOptions {
   pool: Pool;
+  knowledge?: KnowledgePools;
+  knowledgeGuard?: () => void;
   embedder?: (dataset: DatasetConfig) => QueryEmbedder;
   maxQueryLength?: number;
   /** A VACUUM after a run's end failed; the run has already committed, so it does not fail. */
@@ -355,19 +367,63 @@ export const pgvectorEngine = (options: PgvectorEngineOptions): PgvectorEngine =
     };
   };
 
+  const knowledgePool = (() => {
+    const { reader, writer, owner } = options.knowledge ?? {};
+    return reader ?? writer ?? owner;
+  })();
+  const endpointOptions = knowledgePool
+    ? pgvectorEndpointOptions
+    : pgvectorEndpointOptions.refine((o) => o.connection !== 'knowledge', {
+        message: noKnowledgeServer,
+        path: ['connection'],
+      });
+  const onKnowledgeServer = (endpoint: { options: PgvectorEndpointOptions }) => {
+    if (endpoint.options.connection !== 'knowledge') return false;
+    if (!knowledgePool) throw new KnowledgeError('unavailable', noKnowledgeServer);
+    return true;
+  };
+  const notReady = async (): Promise<never> => {
+    throw new KnowledgeError('unavailable', knowledgeNotReady);
+  };
+  const knowledgeConnection: KnowledgeConnection<PgvectorDatasetOptions> = {
+    served: notReady,
+    profiles: (dataset) => profilesOf(dataset).map(([name]) => name),
+    search: notReady,
+    fetch: notReady,
+    range: notReady,
+    facets: notReady,
+  };
+  const knowledgeWriter: IndexWriter<PgvectorDatasetOptions> = {
+    prepare: notReady,
+    store: notReady,
+    promote: notReady,
+    drop: notReady,
+    active: notReady,
+    stats: notReady,
+    // eslint-disable-next-line require-yield
+    read: async function* () {
+      await notReady();
+    },
+  };
+
   const adapter = localKnowledgeAdapter({
     engine: pgvectorEngineName,
     title: 'Innebygd søk',
     tech: 'Postgres med pgvector',
-    endpointOptions: pgvectorEndpointOptions,
+    endpointOptions,
     datasetOptions: pgvectorDatasetOptions,
     capabilities,
     defaults: (draft: DatasetDraft) =>
       draft.options['profiles']
         ? {}
         : { profiles: defaultPgvectorProfiles(draft.embedding !== undefined) },
-    connect: (endpoint) => connect(endpoint.timeoutMs),
+    connect: (endpoint) =>
+      onKnowledgeServer(endpoint) ? knowledgeConnection : connect(endpoint.timeoutMs),
     probe: async (endpoint) => {
+      if (onKnowledgeServer(endpoint)) {
+        await knowledgePool?.query('select 1');
+        return;
+      }
       const { rowCount } = await run(endpoint.timeoutMs, false, (c) =>
         c.query(`select 1 from pg_available_extensions where name = 'vector'`),
       );
@@ -613,9 +669,20 @@ export const pgvectorEngine = (options: PgvectorEngineOptions): PgvectorEngine =
   const writer: IndexWriterAdapter<PgvectorEndpointOptions, PgvectorDatasetOptions> = {
     engine: pgvectorEngineName,
     needs: { vectors: true },
-    endpointOptions: pgvectorEndpointOptions,
+    endpointOptions,
     datasetOptions: pgvectorDatasetOptions,
-    connect: (_endpoint, context) => writerOf(context.signal),
+    connect: (endpoint, context) => {
+      if (!onKnowledgeServer(endpoint)) return writerOf(context.signal);
+      try {
+        options.knowledgeGuard?.();
+      } catch (error) {
+        throw new KnowledgeError(
+          'unavailable',
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      return knowledgeWriter;
+    },
   };
 
   return { adapter, writer };
